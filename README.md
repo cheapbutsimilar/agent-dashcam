@@ -37,7 +37,7 @@ npx agent-dashcam            # opens http://localhost:4317
   - **Dry run first**: a per-file diff of exactly what will be restored, recreated or deleted.
   - **Safe**: the plan is token-locked, so if a file changed since the preview, nothing is touched. Writes never leave the project root, and symlink escapes are refused.
   - **Undoable**: every rewind backs up the touched files to `.agent-dashcam/backups/` first.
-  - **Accurate sources**: file contents come from the session log (`originalFile` snapshots, full `Read`s, `Write` payloads), with Git as a fallback. Files it can't reconstruct are skipped, never guessed.
+  - **Accurate sources**: file contents come from the session log (`originalFile` snapshots, full `Read`s, `Write` payloads), with Git as a fallback. Restores are byte-exact (binary files included). Content that can't be reconstructed losslessly is skipped, never guessed.
 - **🔒 Local only**: zero runtime dependencies. The server binds to `127.0.0.1` and has per-launch token + Host checks. Nothing leaves your machine.
 
 ![rewind dry-run](docs/rewind-preview.png)

@@ -26,15 +26,37 @@ export function commitAtOrBefore(root: string, ts: string): string | undefined {
   return out?.trim() || undefined;
 }
 
-/** File content at a commit. `null` when the path is not a file there; undefined on error. */
-export function showFile(root: string, commit: string, relPath: string): string | null | undefined {
+/** Raw stdout bytes of a git command (no text decoding), undefined on error. */
+function gitBytes(root: string, args: string[]): Buffer | undefined {
+  try {
+    return execFileSync('git', args, { cwd: root, maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Exact bytes of a file at a commit.
+ * `null` = git confirms the path is not a file in that commit; `undefined` = lookup failed.
+ */
+export function showFile(root: string, commit: string, relPath: string): Buffer | null | undefined {
   const entry = git(root, ['ls-tree', commit, '--', relPath]);
   if (entry === undefined) return undefined;
   if (!entry.trim()) return null;
-  // "<mode> <type> <hash>\t<path>" — directories (tree) are not files
+  // "<mode> <type> <hash>\t<path>" — directories (tree) and submodules (commit) are not files
   if (entry.split(/\s+/)[1] !== 'blob') return null;
   // ./ makes the path relative to cwd (= project root) rather than the repo toplevel
-  return git(root, ['show', `${commit}:./${relPath}`]);
+  return gitBytes(root, ['cat-file', 'blob', `${commit}:./${relPath}`]);
+}
+
+/** True when git ignores the path, i.e. git history can say nothing about it. */
+export function isIgnored(root: string, relPath: string): boolean {
+  try {
+    execFileSync('git', ['check-ignore', '-q', '--no-index', '--', relPath], { cwd: root, stdio: 'ignore' });
+    return true; // exit 0 = ignored
+  } catch {
+    return false;
+  }
 }
 
 /** Files tracked under a directory at a commit (project-relative). */

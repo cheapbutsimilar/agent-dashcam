@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { commitAtOrBefore, isGitRepo, showFile } from './collectors/git';
+import { commitAtOrBefore, isGitRepo, isIgnored, showFile } from './collectors/git';
 import { diffFiles, type FileDiff } from './diff';
 import { isUnder, safeJoin } from './paths';
 import type { TimelineEvent } from './types';
@@ -17,8 +17,9 @@ export interface RewindAction {
   reason: string;
   currentExists: boolean;
   targetExists: boolean;
-  /** Diff from the current file to the target (what the rewind will do). */
+  /** Diff from the current file to the target (what the rewind will do). Text files only. */
   diff?: FileDiff;
+  /** Current or target content is binary: restored byte-for-byte, no text diff. */
   binary?: boolean;
 }
 
@@ -36,12 +37,19 @@ export interface RewindPlan {
 
 export interface GitResolver {
   commitAt(ts: string): string | undefined;
-  show(commit: string, relPath: string): string | null | undefined;
+  /** Exact bytes at a commit. `null` = git confirms the path is absent there; `undefined` = unknown. */
+  show(commit: string, relPath: string): Buffer | null | undefined;
+  /** Ignored paths are never in git, so their absence from a commit proves nothing. */
+  isIgnored?(relPath: string): boolean;
 }
 
 export function gitResolver(root: string): GitResolver | undefined {
   if (!isGitRepo(root)) return undefined;
-  return { commitAt: (ts) => commitAtOrBefore(root, ts), show: (c, p) => showFile(root, c, p) };
+  return {
+    commitAt: (ts) => commitAtOrBefore(root, ts),
+    show: (c, p) => showFile(root, c, p),
+    isIgnored: (p) => isIgnored(root, p),
+  };
 }
 
 export class RewindConflictError extends Error {
@@ -57,7 +65,23 @@ const READONLY_CMD =
 
 const emptySummary = (): Record<ActionKind, number> => ({ restore: 0, delete: 0, recreate: 0, unchanged: 0, skip: 0 });
 
-function sha(s: string | null | undefined): string {
+/** Is this exact byte sequence representable as UTF-8 text (safe to diff / decode)? */
+export function isText(buf: Buffer): boolean {
+  return !buf.includes(0) && Buffer.from(buf.toString('utf8'), 'utf8').equals(buf);
+}
+
+/**
+ * Bytes for content captured in the session log, or undefined when the string cannot be
+ * turned back into the original bytes without loss: logs store decoded text, so a binary or
+ * non-UTF-8 file shows up with U+FFFD replacement characters or lone surrogates.
+ */
+export function logContentToBytes(s: string): Buffer | undefined {
+  if (s.includes('\uFFFD')) return undefined;
+  const buf = Buffer.from(s, 'utf8');
+  return buf.toString('utf8') === s ? buf : undefined;
+}
+
+function sha(s: Buffer | null | undefined): string {
   if (s === undefined) return 'unknown';
   if (s === null) return 'absent';
   return createHash('sha256').update(s).digest('hex').slice(0, 16);
@@ -83,7 +107,8 @@ function stateAfter(ev: TimelineEvent, p: string): string | null | undefined {
 }
 
 export interface Target {
-  content: string | null | undefined;
+  /** Exact bytes to restore; `null` = the file must not exist; `undefined` = unknown. */
+  content: Buffer | null | undefined;
   source: RewindAction['source'];
   reason: string;
 }
@@ -96,45 +121,70 @@ export interface Target {
  */
 export function resolveTarget(events: TimelineEvent[], k: number, p: string, git?: GitResolver): Target {
   const label = (e: TimelineEvent) => `#${e.seq + 1} ${e.tool ?? e.type}`;
+  let lossy = false;
+  const fromLog = (s: string | null, reason: string): Target | undefined => {
+    if (s === null) return { content: null, source: 'log', reason };
+    const buf = logContentToBytes(s);
+    if (buf) return { content: buf, source: 'log', reason };
+    lossy = true; // fall through to git, which stores exact bytes
+    return undefined;
+  };
+
   for (let j = k + 1; j < events.length; j++) {
     const e = events[j];
     if (!touches(e, p)) continue;
     const s = stateBefore(e, p);
-    if (s !== undefined) return { content: s, source: 'log', reason: s === null ? `did not exist before ${label(e)}` : `content captured right before ${label(e)}` };
+    if (s !== undefined) {
+      const t = fromLog(s, s === null ? `did not exist before ${label(e)}` : `content captured right before ${label(e)}`);
+      if (t) return t;
+    }
     break;
   }
-  for (let j = k; j >= 0; j--) {
-    const e = events[j];
-    if (!touches(e, p)) continue;
-    const s = stateAfter(e, p);
-    if (s !== undefined) return { content: s, source: 'log', reason: s === null ? `deleted by ${label(e)}` : `content as left by ${label(e)}` };
-    break;
-  }
-  if (git) {
-    const ts = k >= 0 ? events[k].ts : new Date(Date.parse(events[0]?.ts ?? new Date().toISOString()) - 1).toISOString();
-    const commit = git.commitAt(ts);
-    if (commit) {
-      const c = git.show(commit, p);
-      if (typeof c === 'string') return { content: c, source: 'git', reason: `from git commit ${commit.slice(0, 7)}` };
+  if (!lossy) {
+    for (let j = k; j >= 0; j--) {
+      const e = events[j];
+      if (!touches(e, p)) continue;
+      const s = stateAfter(e, p);
+      if (s !== undefined) {
+        const t = fromLog(s, s === null ? `deleted by ${label(e)}` : `content as left by ${label(e)}`);
+        if (t) return t;
+      }
+      break;
     }
   }
-  return { content: undefined, source: 'none', reason: 'no snapshot of this file at that point (not in the log or git)' };
+  if (git) {
+    // A git checkpoint pins the exact commit; otherwise use the latest commit at that time.
+    const ts = k >= 0 ? events[k].ts : new Date(Date.parse(events[0]?.ts ?? new Date().toISOString()) - 1).toISOString();
+    const commit = (k >= 0 ? events[k].commit : undefined) ?? git.commitAt(ts);
+    if (commit) {
+      const c = git.show(commit, p);
+      const short = commit.slice(0, 7);
+      if (c) return { content: c, source: 'git', reason: `from git commit ${short}` };
+      if (c === null && !git.isIgnored?.(p)) return { content: null, source: 'git', reason: `not present in git commit ${short}` };
+    }
+  }
+  return {
+    content: undefined,
+    source: 'none',
+    reason: lossy
+      ? 'content in the log cannot be reconstructed losslessly (binary or non-UTF-8); not restoring'
+      : 'no snapshot of this file at that point (not in the log or git)',
+  };
 }
 
-function readCurrent(root: string, rel: string): { content: string | null; isDir: boolean; binary: boolean } {
+function readCurrent(root: string, rel: string): { content: Buffer | null; isDir: boolean } {
   const abs = safeJoin(root, rel);
   let st: fs.Stats;
   try {
     st = fs.lstatSync(abs);
   } catch {
-    return { content: null, isDir: false, binary: false };
+    return { content: null, isDir: false };
   }
-  if (st.isDirectory()) return { content: null, isDir: true, binary: false };
-  const buf = fs.readFileSync(abs);
-  return { content: buf.toString('utf8'), isDir: false, binary: buf.includes(0) };
+  if (st.isDirectory()) return { content: null, isDir: true };
+  return { content: fs.readFileSync(abs), isDir: false };
 }
 
-function readCurrentSafe(root: string, rel: string): string | null | undefined {
+function readCurrentSafe(root: string, rel: string): Buffer | null | undefined {
   try {
     return readCurrent(root, rel).content;
   } catch {
@@ -151,13 +201,16 @@ export interface PlanOptions {
   git?: GitResolver | null;
 }
 
-function compute(opts: PlanOptions): { plan: RewindPlan; targets: Map<string, string | null> } {
+function compute(opts: PlanOptions): { plan: RewindPlan; targets: Map<string, Buffer | null> } {
   const { root, events } = opts;
   const mode = opts.mode ?? 'after';
   const idx = events.findIndex((e) => e.id === opts.eventId);
   if (idx < 0) throw new Error(`Unknown event: ${opts.eventId}`);
   const k = mode === 'before' ? idx - 1 : idx;
   const git = opts.git === null ? undefined : (opts.git ?? gitResolver(root));
+  // Rewinding to a git commit means "make the tree look like that commit", so uncommitted
+  // working-tree paths are in scope too (resolved against that commit).
+  const refCommit = k >= 0 ? events[k].commit : undefined;
 
   const affected = new Set<string>();
   const warnings: string[] = [];
@@ -174,14 +227,14 @@ function compute(opts: PlanOptions): { plan: RewindPlan; targets: Map<string, st
       if (e.type === 'file_delete' && e.recursive) e.deletedFiles?.forEach((f) => affected.add(f));
       else affected.add(e.path);
     }
-    if (e.type === 'checkpoint' && e.source === 'git' && e.commit && e.files) e.files.forEach((f) => affected.add(f.path));
+    if (e.type === 'checkpoint' && e.source === 'git' && e.files && (e.commit || refCommit)) e.files.forEach((f) => affected.add(f.path));
     if (e.type === 'shell_cmd' && e.command && !READONLY_CMD.test(e.command)) shell++;
   }
   if (outside) warnings.push(`${outside} change(s) outside the project root cannot be rewound and were skipped.`);
   if (shell) warnings.push(`${shell} shell command(s) ran after this point. Side effects that are not visible in the log (npm install, sed -i, chmod, …) are not reverted.`);
 
   const actions: RewindAction[] = [];
-  const targets = new Map<string, string | null>();
+  const targets = new Map<string, Buffer | null>();
   for (const p of [...affected].sort()) {
     if (p === '.' || p.startsWith('.agent-dashcam/') || p === '.git' || p.startsWith('.git/')) continue;
     let cur: ReturnType<typeof readCurrent>;
@@ -205,11 +258,12 @@ function compute(opts: PlanOptions): { plan: RewindPlan; targets: Map<string, st
     let action: ActionKind;
     if (t.content === null) action = cur.content === null ? 'unchanged' : 'delete';
     else if (cur.content === null) action = 'recreate';
-    else action = cur.content === t.content ? 'unchanged' : 'restore';
+    else action = cur.content.equals(t.content) ? 'unchanged' : 'restore';
     const a: RewindAction = { ...base, action, targetExists: t.content !== null };
     if (action !== 'unchanged') {
-      if (cur.binary) a.binary = true;
-      else a.diff = diffFiles(cur.content, t.content);
+      const textual = (b: Buffer | null) => b === null || isText(b);
+      if (textual(cur.content) && textual(t.content)) a.diff = diffFiles(cur.content?.toString('utf8'), t.content?.toString('utf8'));
+      else a.binary = true;
       targets.set(p, t.content);
     }
     actions.push(a);
@@ -335,7 +389,7 @@ export function applyRewind(opts: PlanOptions & { token: string }): ApplyResult 
   for (const a of todo) {
     const t = targets.get(a.path);
     if (t === null || a.action === 'delete') removeFile(opts.root, a.path);
-    else if (typeof t === 'string') writeFile(opts.root, a.path, t);
+    else if (Buffer.isBuffer(t)) writeFile(opts.root, a.path, t); // exact bytes, no re-encoding
   }
   logRewind(opts.root, { targetEventId: plan.targetEventId, targetTitle: plan.targetTitle, mode: plan.mode, files: todo.length, backupId: backup.id });
   return { backupId: backup.id, changed: todo.map((a) => ({ path: a.path, action: a.action })), plan };
