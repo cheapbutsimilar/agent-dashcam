@@ -1,4 +1,5 @@
 import { normalizePath } from '../paths';
+import { stripHeredocs } from '../shell';
 import type { TimelineEvent } from '../types';
 
 /**
@@ -61,7 +62,7 @@ function applyEdit(content: string, oldStr: string, newStr: string, replaceAll?:
 /** Extract the targets of `rm` invocations in a shell command. */
 export function parseRmTargets(command: string): { path: string; recursive: boolean }[] {
   const out: { path: string; recursive: boolean }[] = [];
-  const segments = command.split(/&&|\|\||;|\||\n/);
+  const segments = stripHeredocs(command).split(/&&|\|\||;|\||\n/);
   for (const seg of segments) {
     const tokens = seg.trim().match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
     let i = 0;

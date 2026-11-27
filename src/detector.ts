@@ -1,3 +1,4 @@
+import { stripHeredocs } from './shell';
 import type { Risk, Severity, TimelineEvent } from './types';
 
 interface CommandRule {
@@ -86,7 +87,8 @@ export function maxSeverity(risks: Risk[]): Severity | undefined {
 }
 
 /** Risks for a single shell command. */
-export function detectCommandRisks(command: string): Risk[] {
+export function detectCommandRisks(rawCommand: string): Risk[] {
+  const command = stripHeredocs(rawCommand);
   const risks: Risk[] = [];
   const seen = new Set<string>();
   for (const r of COMMAND_RULES) {
@@ -136,7 +138,7 @@ export function detectEventRisks(ev: TimelineEvent): Risk[] {
     // Only flag secrets that were introduced by this event.
     const label = written ? detectSecretContent(written) : undefined;
     if (label && !(ev.before && detectSecretContent(ev.before) === label)) {
-      risks.push({ rule: 'hardcoded-secret', severity: 'high', message: `Writes a ${label} into source code` });
+      risks.push({ rule: 'hardcoded-secret', severity: 'high', message: `Writes a secret (${label}) into source code` });
     }
   }
 

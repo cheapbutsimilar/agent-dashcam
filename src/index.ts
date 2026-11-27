@@ -1,6 +1,7 @@
 export * from './types';
 export * from './diff';
 export { parseClaudeSession, parseRmTargets } from './parsers/claude';
+export { stripHeredocs } from './shell';
 export { detectCommandRisks, detectEventRisks, detectIncidents, detectSensitivePath, detectSecretContent, maxSeverity } from './detector';
 export { collectGitEvents } from './collectors/git';
 export { discoverSessions, encodeProjectDir } from './collectors/discover';
