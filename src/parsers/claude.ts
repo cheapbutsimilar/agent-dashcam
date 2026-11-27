@@ -1,3 +1,4 @@
+import * as path from 'node:path';
 import { normalizePath } from '../paths';
 import { stripHeredocs } from '../shell';
 import type { TimelineEvent } from '../types';
@@ -59,30 +60,99 @@ function applyEdit(content: string, oldStr: string, newStr: string, replaceAll?:
   return replaceAll ? content.split(oldStr).join(newStr) : content.replace(oldStr, () => newStr);
 }
 
-/** Extract the targets of `rm` invocations in a shell command. */
-export function parseRmTargets(command: string): { path: string; recursive: boolean }[] {
-  const out: { path: string; recursive: boolean }[] = [];
-  const segments = stripHeredocs(command).split(/&&|\|\||;|\||\n/);
-  for (const seg of segments) {
-    const tokens = seg.trim().match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
-    let i = 0;
-    while (i < tokens.length && /^(sudo|command|builtin|\w+=\S*)$/.test(tokens[i])) i++;
-    if (tokens[i] !== 'rm') continue;
-    let recursive = false;
-    let endOfFlags = false;
-    for (const raw of tokens.slice(i + 1)) {
-      if (!endOfFlags && raw === '--') {
-        endOfFlags = true;
-        continue;
+export interface RmTarget {
+  /** Absolute, `~/`-relative, or relative to the cwd the command started in. */
+  path: string;
+  recursive: boolean;
+}
+
+const UNRESOLVABLE = /[*?$`{}[\]>~]/;
+
+/**
+ * Apply a `cd`/`pushd` to the tracked directory. Directories are relative to the command's
+ * starting cwd ('' = unchanged); `null` means the effective directory can no longer be known.
+ */
+function changeDir(dir: string | null, args: string[]): string | null {
+  const target = args.find((a) => !/^-[LPe@]+$/.test(a));
+  if (target === undefined || target === '-') return null; // `cd` (home) / `cd -` (previous dir)
+  const quotedSingle = /^'.*'$/.test(target);
+  const t = target.replace(/^["']|["']$/g, '');
+  if (!quotedSingle && UNRESOLVABLE.test(t)) return null; // $VAR, $(cmd), globs, ~
+  if (t === '') return null;
+  let next: string;
+  if (path.posix.isAbsolute(t)) next = path.posix.normalize(t);
+  else if (dir === null) return null;
+  else next = path.posix.join(dir || '.', t);
+  next = next.replace(/\/+$/, '');
+  return next === '.' ? '' : next || '/';
+}
+
+/**
+ * Extract the targets of `rm` invocations in a shell command, resolving relative operands
+ * against directory changes made earlier in the same command (`cd sub && rm a.txt` -> sub/a.txt).
+ * Relative operands are dropped when the effective directory cannot be determined.
+ */
+export function parseRmTargets(command: string): RmTarget[] {
+  const out: RmTarget[] = [];
+  let dir: string | null = '';
+  const subshells: (string | null)[] = [];
+  let substDepth = 0; // open $( … ) / <( … ) command substitutions
+
+  for (const seg of stripHeredocs(command).split(/&&|\|\||;|\||\n/)) {
+    const insideSubst = substDepth > 0;
+    const tokens: string[] = [];
+    let closes = 0;
+    for (let tok of seg.trim().match(/"[^"]*"|'[^']*'|\S+/g) ?? []) {
+      if (!/^["']/.test(tok)) {
+        while (tok.startsWith('(')) {
+          subshells.push(dir); // a subshell's cd does not leak out of it
+          tok = tok.slice(1);
+        }
+        substDepth += (tok.match(/[$<>]\(/g) ?? []).length;
+        let tokenCloses = 0;
+        for (const ch of tok) {
+          if (ch !== ')') continue;
+          if (substDepth > 0) substDepth--;
+          else tokenCloses++;
+        }
+        if (tokenCloses) tok = tok.replace(new RegExp(`\\){1,${tokenCloses}}$`), '');
+        closes += tokenCloses;
       }
-      if (!endOfFlags && raw.startsWith('-')) {
-        if (/^-[a-zA-Z]*[rR]/.test(raw) || raw === '--recursive') recursive = true;
-        continue;
-      }
-      const t = raw.replace(/^["']|["']$/g, '');
-      if (/[*?$`{}[\]>]/.test(t) || t === '') continue; // globs / expansions cannot be resolved statically
-      out.push({ path: t.replace(/\/+$/, '') || '/', recursive });
+      if (tok) tokens.push(tok);
     }
+
+    if (!insideSubst) {
+      let i = 0;
+      while (i < tokens.length && /^(sudo|command|builtin|\w+=\S*)$/.test(tokens[i])) i++;
+      const cmd = tokens[i];
+      const args = tokens.slice(i + 1);
+      if (cmd === 'cd' || cmd === 'pushd') dir = changeDir(dir, args);
+      else if (cmd === 'popd') dir = null;
+      else if (cmd === 'rm') {
+        let recursive = false;
+        let endOfFlags = false;
+        const operands: string[] = [];
+        for (const raw of args) {
+          if (!endOfFlags && raw === '--') {
+            endOfFlags = true;
+            continue;
+          }
+          if (!endOfFlags && raw.startsWith('-')) {
+            if (/^-[a-zA-Z]*[rR]/.test(raw) || raw === '--recursive') recursive = true;
+            continue;
+          }
+          const t = raw.replace(/^["']|["']$/g, '');
+          if (t === '' || /[*?$`{}[\]>]/.test(t)) continue; // globs / expansions cannot be resolved statically
+          operands.push(t.replace(/\/+$/, '') || '/');
+        }
+        for (const t of operands) {
+          if (t.startsWith('/') || t.startsWith('~/')) out.push({ path: t, recursive });
+          else if (dir !== null) out.push({ path: dir ? path.posix.join(dir, t) : t, recursive });
+          // else: relative operand in an unknown directory — do not guess
+        }
+      }
+    }
+    for (let c = 0; c < closes && subshells.length; c++) dir = subshells.pop()!;
   }
   return out;
 }
