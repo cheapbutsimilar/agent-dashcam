@@ -1,0 +1,11 @@
+export * from './types';
+export * from './diff';
+export { parseClaudeSession, parseRmTargets } from './parsers/claude';
+export { detectCommandRisks, detectEventRisks, detectIncidents, detectSensitivePath, detectSecretContent, maxSeverity } from './detector';
+export { collectGitEvents } from './collectors/git';
+export { discoverSessions, encodeProjectDir } from './collectors/discover';
+export { buildTimeline, finalizeEvents } from './timeline';
+export { planRewind, applyRewind, restoreBackup, listBackups, RewindConflictError } from './rewind';
+export { createDemo } from './demo';
+export { createServer } from './server';
+export { VERSION } from './version';
