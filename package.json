@@ -1,0 +1,41 @@
+{
+  "name": "agent-dashcam",
+  "version": "0.1.0",
+  "description": "A dashcam & time-machine debugger for AI coding agents: replay every file edit and command, spot risky actions, rewind any mistake in 1 second.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "agent-dashcam": "dist/src/cli.js"
+  },
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "files": [
+    "dist/src",
+    "public",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test \"dist/test/**/*.test.js\"",
+    "start": "node dist/src/cli.js",
+    "demo": "node dist/src/cli.js --demo",
+    "prepare": "tsc -p tsconfig.json"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "ai-agent",
+    "debugger",
+    "rollback",
+    "timeline",
+    "dashcam"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
